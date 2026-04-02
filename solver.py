@@ -1,322 +1,299 @@
 from __future__ import annotations
 
-from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional, Set, Tuple
+from typing import Any, Dict, List, Tuple
+
+from ortools.sat.python import cp_model
 
 
-@dataclass
-class EmployeeState:
-    assigned_days: Set[int] = field(default_factory=set)
-    day_to_shift: Dict[int, int] = field(default_factory=dict)
-    total_assignments: int = 0
-    night_assignments: int = 0
-    weekend_assignments: int = 0
+def _summarize_fairness(
+    solver: cp_model.CpSolver,
+    work: Dict[Tuple[int, int, int], cp_model.IntVar],
+    num_employees: int,
+    num_days: int,
+    num_shifts: int,
+    day_to_is_weekend: List[int],
+    shift_is_night: List[bool],
+) -> Dict[str, Any]:
+    total_counts = []
+    night_counts = []
+    weekend_counts = []
 
+    for e in range(num_employees):
+        total = 0
+        night = 0
+        weekend = 0
+        for d in range(num_days):
+            for s in range(num_shifts):
+                val = solver.Value(work[(e, d, s)])
+                total += val
+                if shift_is_night[s]:
+                    night += val
+                if day_to_is_weekend[d]:
+                    weekend += val
+        total_counts.append(total)
+        night_counts.append(night)
+        weekend_counts.append(weekend)
 
-@dataclass
-class SearchState:
-    employee_states: List[EmployeeState]
-    assignments: List[Dict[str, int]]
-    best_assignments: List[Dict[str, int]] = field(default_factory=list)
-    best_score: Optional[int] = None
+    def _spread(values: List[int]) -> int:
+        return (max(values) - min(values)) if values else 0
 
+    warnings = []
+    total_spread = _spread(total_counts)
+    night_spread = _spread(night_counts)
+    weekend_spread = _spread(weekend_counts)
 
-MAX_BACKTRACK_STEPS = 200000
+    if total_spread >= 3:
+        warnings.append("총 근무 수 편차가 다소 큽니다.")
+    if night_spread >= 2:
+        warnings.append("야간 근무 편차가 다소 큽니다.")
+    if weekend_spread >= 2:
+        warnings.append("주말 근무 편차가 다소 큽니다.")
 
-
-def _build_static_unassigned(params: Dict[str, Any]) -> List[Dict[str, Any]]:
-    return list(params.get("precheck_issues", []))
-
-
-
-def _build_generic_infeasible_reasons(params: Dict[str, Any]) -> List[Dict[str, Any]]:
-    reasons = _build_static_unassigned(params)
-    if reasons:
-        return reasons
-
-    tight_spots: List[Dict[str, Any]] = []
-    required_staff = params["required_staff"]
-    shift_names = params["shift_names"]
-    eligible = params["eligible"]
-    for d in range(params["num_days"]):
-        for s in range(params["num_shifts"]):
-            candidate_count = sum(eligible[e][d][s] for e in range(params["num_employees"]))
-            if candidate_count <= required_staff[s] + 1:
-                tight_spots.append({
-                    "dayIndex": d,
-                    "shiftName": shift_names[s],
-                    "reason": (
-                        "후보 풀이 매우 좁아 휴식시간/연속근무/전체 수요 제약과 결합되면서 "
-                        "배정 불가능해졌을 수 있습니다."
-                    ),
-                    "candidateCount": candidate_count,
-                    "requiredCount": required_staff[s],
-                })
-    if tight_spots:
-        return tight_spots[:10]
-
-    return [{
-        "reason": "정적 후보 수는 충분하지만, 최소 휴식시간·연속근무 제한·총 수요가 동시에 충돌해 해를 찾지 못했습니다."
-    }]
-
-
-
-def _is_consecutive_limit_ok(employee_state: EmployeeState, day: int, limit: int) -> bool:
-    if day in employee_state.assigned_days:
-        return False
-
-    streak = 1
-    cursor = day - 1
-    while cursor in employee_state.assigned_days:
-        streak += 1
-        cursor -= 1
-    cursor = day + 1
-    while cursor in employee_state.assigned_days:
-        streak += 1
-        cursor += 1
-    return streak <= limit
-
-
-
-def _violates_rest(employee_state: EmployeeState, day: int, shift_idx: int, incompatible_pairs: Set[Tuple[int, int]]) -> bool:
-    prev_shift = employee_state.day_to_shift.get(day - 1)
-    if prev_shift is not None and (prev_shift, shift_idx) in incompatible_pairs:
-        return True
-
-    next_shift = employee_state.day_to_shift.get(day + 1)
-    if next_shift is not None and (shift_idx, next_shift) in incompatible_pairs:
-        return True
-    return False
-
-
-
-def _candidate_soft_score(
-    employee_index: int,
-    day: int,
-    shift_idx: int,
-    employee_state: EmployeeState,
-    params: Dict[str, Any],
-) -> int:
-    preferences = params["preferences"]
-    night_shift_indices = set(params.get("night_shift_indices", []))
-    weekend_day_indices = set(params.get("weekend_day_indices", []))
-
-    score = 0
-    if shift_idx in preferences[employee_index]:
-        score += 100
-
-    score -= employee_state.total_assignments * 4
-    if shift_idx in night_shift_indices:
-        score -= employee_state.night_assignments * 8
-    if day in weekend_day_indices:
-        score -= employee_state.weekend_assignments * 6
-
-    # 같은 shift 반복을 약간 선호하지 않음
-    prev_shift = employee_state.day_to_shift.get(day - 1)
-    if prev_shift == shift_idx:
-        score -= 3
-
-    return score
-
-
-
-def _build_slots(params: Dict[str, Any]) -> List[Tuple[int, int, int]]:
-    slots: List[Tuple[int, int, int]] = []
-    eligible = params["eligible"]
-    required_staff = params["required_staff"]
-    num_employees = params["num_employees"]
-    num_days = params["num_days"]
-    num_shifts = params["num_shifts"]
-
-    slot_meta: List[Tuple[int, int, int, int]] = []
-    for d in range(num_days):
-        for s in range(num_shifts):
-            candidate_count = sum(eligible[e][d][s] for e in range(num_employees))
-            for k in range(required_staff[s]):
-                slot_meta.append((candidate_count, d, s, k))
-
-    slot_meta.sort(key=lambda item: (item[0], item[1], item[2], item[3]))
-    return [(d, s, k) for _, d, s, k in slot_meta]
-
-
-
-def _compute_fairness(employee_states: List[EmployeeState]) -> Dict[str, Any]:
-    totals = [es.total_assignments for es in employee_states]
-    nights = [es.night_assignments for es in employee_states]
-    weekends = [es.weekend_assignments for es in employee_states]
     return {
-        "assignmentSpread": max(totals) - min(totals) if totals else 0,
-        "nightSpread": max(nights) - min(nights) if nights else 0,
-        "weekendSpread": max(weekends) - min(weekends) if weekends else 0,
-        "perEmployee": [
-            {
-                "employeeIndex": idx,
-                "totalAssignments": es.total_assignments,
-                "nightAssignments": es.night_assignments,
-                "weekendAssignments": es.weekend_assignments,
-            }
-            for idx, es in enumerate(employee_states)
-        ],
+        "totalsPerEmployee": total_counts,
+        "nightPerEmployee": night_counts,
+        "weekendPerEmployee": weekend_counts,
+        "totalSpread": total_spread,
+        "nightSpread": night_spread,
+        "weekendSpread": weekend_spread,
+        "warnings": warnings,
     }
-
 
 
 def solve_shift_optimization(params: Dict[str, Any]) -> Dict[str, Any]:
-    precheck_issues = _build_static_unassigned(params)
-    if precheck_issues:
+    precheck_infeasible_reasons = params.get("precheck_infeasible_reasons", [])
+    if precheck_infeasible_reasons:
         return {
             "status": "FAILED",
-            "message": "정적 제약만으로도 일부 근무를 채울 수 없습니다.",
+            "message": "사전 검증에서 배정 불가능한 시프트가 발견되었습니다.",
             "assignments": [],
-            "summary": {},
-            "fairness": {},
+            "unassigned_shifts": precheck_infeasible_reasons,
             "warnings": [],
-            "unassignedShifts": precheck_issues,
+            "solver_meta": {"phase": "precheck"},
         }
 
     num_employees = params["num_employees"]
-    night_shift_indices = set(params.get("night_shift_indices", []))
-    weekend_day_indices = set(params.get("weekend_day_indices", []))
-    incompatible_pairs = {tuple(pair) for pair in params.get("incompatible_shift_pairs", [])}
+    num_days = params["num_days"]
+    num_shifts = params["num_shifts"]
+    eligibility = params["eligibility"]
+    shift_required_counts = params["shift_required_counts"]
+    rest_conflicts = params["rest_conflicts"]
+    employee_max_assignments = params["employee_max_assignments"]
+    employee_max_consecutive_days = params["employee_max_consecutive_days"]
+    preferences = params["preferences"]
+    day_to_is_weekend = params["day_to_is_weekend"]
+    shift_is_night = params["shift_is_night"]
+    weights = params["weights"]
+    time_limit_seconds = params["solver_time_limit_seconds"]
 
-    slots = _build_slots(params)
-    search_state = SearchState(
-        employee_states=[EmployeeState() for _ in range(num_employees)],
-        assignments=[],
-    )
-    visited = {"count": 0}
+    night_shift_indices = [s for s in range(num_shifts) if shift_is_night[s]]
+    total_night_slots = num_days * sum(shift_required_counts[s] for s in night_shift_indices)
 
-    def dfs(slot_index: int, running_score: int) -> None:
-        if visited["count"] >= MAX_BACKTRACK_STEPS:
-            return
-        visited["count"] += 1
+    # eligibility 기반으로 실제 Night 가능 인원 재계산
+    night_eligible_employees: List[int] = []
+    for e in range(num_employees):
+        if any(
+            eligibility[e][d][s]
+            for d in range(num_days)
+            for s in night_shift_indices
+        ):
+            night_eligible_employees.append(e)
 
-        if slot_index == len(slots):
-            fairness = _compute_fairness(search_state.employee_states)
-            final_score = (
-                running_score
-                - fairness["assignmentSpread"] * 10
-                - fairness["nightSpread"] * 20
-                - fairness["weekendSpread"] * 10
+    model = cp_model.CpModel()
+    work: Dict[Tuple[int, int, int], cp_model.IntVar] = {}
+    works_day: Dict[Tuple[int, int], cp_model.IntVar] = {}
+
+    for e in range(num_employees):
+        for d in range(num_days):
+            for s in range(num_shifts):
+                work[(e, d, s)] = model.NewBoolVar(f"work_e{e}_d{d}_s{s}")
+                if not eligibility[e][d][s]:
+                    model.Add(work[(e, d, s)] == 0)
+
+    for e in range(num_employees):
+        for d in range(num_days):
+            works_day[(e, d)] = model.NewBoolVar(f"works_day_e{e}_d{d}")
+            daily_sum = sum(work[(e, d, s)] for s in range(num_shifts))
+            model.Add(daily_sum <= 1)
+            model.Add(daily_sum == works_day[(e, d)])
+
+    for d in range(num_days):
+        for s in range(num_shifts):
+            model.Add(sum(work[(e, d, s)] for e in range(num_employees)) == shift_required_counts[s])
+
+    for e in range(num_employees):
+        model.Add(sum(works_day[(e, d)] for d in range(num_days)) <= employee_max_assignments[e])
+
+    for e in range(num_employees):
+        max_consecutive = employee_max_consecutive_days[e]
+        if max_consecutive < num_days:
+            for start in range(num_days - max_consecutive):
+                model.Add(
+                    sum(works_day[(e, d)] for d in range(start, start + max_consecutive + 1))
+                    <= max_consecutive
+                )
+
+    for e in range(num_employees):
+        for d, s1, s2 in rest_conflicts:
+            model.Add(work[(e, d, s1)] + work[(e, d + 1, s2)] <= 1)
+
+    total_assignments = []
+    night_assignments = []
+    weekend_assignments = []
+    preference_hits = []
+
+    for e in range(num_employees):
+        total_var = model.NewIntVar(0, num_days, f"total_e{e}")
+        night_var = model.NewIntVar(0, total_night_slots, f"night_e{e}")
+        weekend_var = model.NewIntVar(0, num_days, f"weekend_e{e}")
+        pref_var = model.NewIntVar(0, num_days, f"pref_e{e}")
+
+        model.Add(total_var == sum(works_day[(e, d)] for d in range(num_days)))
+        model.Add(
+            night_var
+            == sum(
+                work[(e, d, s)]
+                for d in range(num_days)
+                for s in range(num_shifts)
+                if shift_is_night[s]
             )
-            if search_state.best_score is None or final_score > search_state.best_score:
-                search_state.best_score = final_score
-                search_state.best_assignments = [dict(item) for item in search_state.assignments]
-            return
+        )
+        model.Add(
+            weekend_var
+            == sum(
+                work[(e, d, s)]
+                for d in range(num_days)
+                for s in range(num_shifts)
+                if day_to_is_weekend[d]
+            )
+        )
+        preferred_shift_indices = preferences[e]
+        model.Add(
+            pref_var
+            == sum(
+                work[(e, d, s)]
+                for d in range(num_days)
+                for s in preferred_shift_indices
+            )
+        )
 
-        day, shift_idx, _ = slots[slot_index]
-        candidates = []
-        for employee_index in range(num_employees):
-            employee_state = search_state.employee_states[employee_index]
-            if params["eligible"][employee_index][day][shift_idx] == 0:
-                continue
-            if day in employee_state.assigned_days:
-                continue
-            if employee_state.total_assignments >= params["employee_max_assignments"][employee_index]:
-                continue
-            if not _is_consecutive_limit_ok(
-                employee_state,
-                day,
-                params["employee_max_consecutive_days"][employee_index],
-            ):
-                continue
-            if _violates_rest(employee_state, day, shift_idx, incompatible_pairs):
-                continue
+        total_assignments.append(total_var)
+        night_assignments.append(night_var)
+        weekend_assignments.append(weekend_var)
+        preference_hits.append(pref_var)
 
-            score = _candidate_soft_score(employee_index, day, shift_idx, employee_state, params)
-            candidates.append((score, employee_index))
+    total_max = model.NewIntVar(0, num_days, "total_max")
+    total_min = model.NewIntVar(0, num_days, "total_min")
+    weekend_max = model.NewIntVar(0, num_days, "weekend_max")
+    weekend_min = model.NewIntVar(0, num_days, "weekend_min")
 
-        candidates.sort(reverse=True)
+    model.AddMaxEquality(total_max, total_assignments)
+    model.AddMinEquality(total_min, total_assignments)
+    model.AddMaxEquality(weekend_max, weekend_assignments)
+    model.AddMinEquality(weekend_min, weekend_assignments)
 
-        for score, employee_index in candidates:
-            employee_state = search_state.employee_states[employee_index]
-            employee_state.assigned_days.add(day)
-            employee_state.day_to_shift[day] = shift_idx
-            employee_state.total_assignments += 1
-            if shift_idx in night_shift_indices:
-                employee_state.night_assignments += 1
-            if day in weekend_day_indices:
-                employee_state.weekend_assignments += 1
+    total_spread = model.NewIntVar(0, num_days, "total_spread")
+    weekend_spread = model.NewIntVar(0, num_days, "weekend_spread")
+    model.Add(total_spread == total_max - total_min)
+    model.Add(weekend_spread == weekend_max - weekend_min)
 
-            assignment = {
-                "day_index": day,
-                "employee_index": employee_index,
-                "shift_index": shift_idx,
-            }
-            search_state.assignments.append(assignment)
+    # Night fairness: Night eligible 직원 집합만 대상으로 강하게 분산
+    night_fairness_penalty_terms = []
+    night_spread_eligible = None
 
-            dfs(slot_index + 1, running_score + score)
+    if len(night_eligible_employees) >= 2:
+        eligible_night_vars = [night_assignments[e] for e in night_eligible_employees]
 
-            search_state.assignments.pop()
-            if day in weekend_day_indices:
-                employee_state.weekend_assignments -= 1
-            if shift_idx in night_shift_indices:
-                employee_state.night_assignments -= 1
-            employee_state.total_assignments -= 1
-            del employee_state.day_to_shift[day]
-            employee_state.assigned_days.remove(day)
+        night_max_eligible = model.NewIntVar(0, total_night_slots, "night_max_eligible")
+        night_min_eligible = model.NewIntVar(0, total_night_slots, "night_min_eligible")
+        night_spread_eligible = model.NewIntVar(0, total_night_slots, "night_spread_eligible")
+        model.AddMaxEquality(night_max_eligible, eligible_night_vars)
+        model.AddMinEquality(night_min_eligible, eligible_night_vars)
+        model.Add(night_spread_eligible == night_max_eligible - night_min_eligible)
+        night_fairness_penalty_terms.append(night_spread_eligible)
 
-    dfs(0, 0)
+        for i in range(len(night_eligible_employees)):
+            for j in range(i + 1, len(night_eligible_employees)):
+                ei = night_eligible_employees[i]
+                ej = night_eligible_employees[j]
+                diff = model.NewIntVar(0, total_night_slots, f"night_diff_{ei}_{ej}")
+                model.AddAbsEquality(diff, night_assignments[ei] - night_assignments[ej])
+                night_fairness_penalty_terms.append(diff)
 
-    if not search_state.best_assignments:
+    objective = (
+        weights["preference"] * sum(preference_hits)
+        - weights["fairness"] * total_spread
+        - weights["weekend"] * weekend_spread
+        - weights["night"] * sum(night_fairness_penalty_terms)
+    )
+    model.Maximize(objective)
+
+    solver = cp_model.CpSolver()
+    solver.parameters.max_time_in_seconds = time_limit_seconds
+    solver.parameters.num_search_workers = 8
+    status = solver.Solve(model)
+
+    if status not in (cp_model.OPTIMAL, cp_model.FEASIBLE):
         return {
             "status": "FAILED",
-            "message": "모든 하드 제약을 만족하는 배정안을 찾지 못했습니다.",
+            "message": "모든 하드 제약을 만족하는 근무표를 찾지 못했습니다.",
             "assignments": [],
-            "summary": {},
-            "fairness": {},
+            "unassigned_shifts": [],
             "warnings": [],
-            "unassignedShifts": _build_generic_infeasible_reasons(params),
+            "solver_meta": {
+                "status": int(status),
+                "phase": "solve",
+                "nightEligibleEmployeeIndices": night_eligible_employees,
+                "nightEligibleCount": len(night_eligible_employees),
+            },
         }
 
-    best_employee_states = [EmployeeState() for _ in range(num_employees)]
-    for assignment in search_state.best_assignments:
-        day = assignment["day_index"]
-        employee_index = assignment["employee_index"]
-        shift_idx = assignment["shift_index"]
-        es = best_employee_states[employee_index]
-        es.assigned_days.add(day)
-        es.day_to_shift[day] = shift_idx
-        es.total_assignments += 1
-        if shift_idx in night_shift_indices:
-            es.night_assignments += 1
-        if day in weekend_day_indices:
-            es.weekend_assignments += 1
+    assignments = []
+    for d, date_label in enumerate(params["dates"]):
+        for e in range(num_employees):
+            for s in range(num_shifts):
+                if solver.Value(work[(e, d, s)]):
+                    assignments.append(
+                        {
+                            "date": date_label,
+                            "day_index": d,
+                            "employee_index": e,
+                            "shift_index": s,
+                        }
+                    )
 
-    fairness = _compute_fairness(best_employee_states)
-    preference_matches = sum(
-        1
-        for assignment in search_state.best_assignments
-        if assignment["shift_index"] in params["preferences"][assignment["employee_index"]]
+    fairness_summary = _summarize_fairness(
+        solver,
+        work,
+        num_employees,
+        num_days,
+        num_shifts,
+        day_to_is_weekend,
+        shift_is_night,
     )
 
-    warnings: List[str] = []
-    if fairness["assignmentSpread"] > 2:
-        warnings.append("총 근무 수 편차가 다소 큽니다.")
-    if fairness["nightSpread"] > 1:
-        warnings.append("야간 근무 편차가 다소 큽니다.")
-    if fairness["weekendSpread"] > 1:
-        warnings.append("주말 근무 편차가 다소 큽니다.")
-    if visited["count"] >= MAX_BACKTRACK_STEPS:
-        warnings.append("탐색 한도 내 최선안을 반환했습니다. 데이터가 커지면 OR-Tools 전환을 권장합니다.")
+    message = "근무표 생성이 완료되었습니다."
+    if status == cp_model.FEASIBLE:
+        message = "근무표 생성이 완료되었습니다. 시간 제한 내에서 실행 가능한 최선안을 반환했습니다."
 
-    summary = {
-        "totalAssignments": len(search_state.best_assignments),
-        "requiredSlots": sum(params["required_staff"]) * params["num_days"],
-        "preferenceMatches": preference_matches,
-        "solverStatus": "BACKTRACKING_BEST_EFFORT",
-        "searchSteps": visited["count"],
+    solver_meta = {
+        "status": "OPTIMAL" if status == cp_model.OPTIMAL else "FEASIBLE",
+        "objectiveValue": solver.ObjectiveValue(),
+        "bestBound": solver.BestObjectiveBound(),
+        "wallTimeSeconds": solver.WallTime(),
+        "timeLimitSeconds": time_limit_seconds,
+        "nightEligibleEmployeeIndices": night_eligible_employees,
+        "nightEligibleCount": len(night_eligible_employees),
     }
+    if night_spread_eligible is not None:
+        solver_meta["nightSpreadEligibleOnly"] = solver.Value(night_spread_eligible)
 
     return {
         "status": "SUCCESS",
-        "message": "하드 제약을 만족하는 근무표 초안을 생성했습니다.",
-        "assignments": sorted(
-            search_state.best_assignments,
-            key=lambda x: (x["day_index"], x["shift_index"], x["employee_index"]),
-        ),
-        "summary": summary,
-        "fairness": fairness,
-        "warnings": warnings,
-        "unassignedShifts": [],
+        "message": message,
+        "assignments": assignments,
+        "fairness_summary": {k: v for k, v in fairness_summary.items() if k != "warnings"},
+        "warnings": fairness_summary["warnings"],
+        "unassigned_shifts": [],
+        "solver_meta": solver_meta,
     }
