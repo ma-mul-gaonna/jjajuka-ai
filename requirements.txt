@@ -1,6 +1,6 @@
 # --- Core AI & LLM ---
 langchain>=0.1.0
-langchain-google-genai>=1.0.0   # Gemini 1.5 Flash 연동용
+langchain-google-genai>=1.0.0   # Gemini 2.5 Flash 연동용
 langgraph>=0.0.10               # 워크플로우 제어(에이전틱 워크플로우)
 
 # --- Mathematical Optimization ---

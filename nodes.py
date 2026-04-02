@@ -1,260 +1,316 @@
 from __future__ import annotations
 
-from datetime import datetime, timedelta
+from datetime import date, datetime, time, timedelta
 from typing import Any, Dict, List, Tuple
 
 from solver import solve_shift_optimization
+
 
 DATE_FMT = "%Y-%m-%d"
 TIME_FMT = "%H:%M"
 
 
-def _parse_date(value: str) -> datetime:
-    return datetime.strptime(value, DATE_FMT)
+def _parse_date(value: str) -> date:
+    return datetime.strptime(value, DATE_FMT).date()
 
 
-def _parse_time(value: str) -> datetime:
-    return datetime.strptime(value, TIME_FMT)
+def _parse_time(value: str) -> time:
+    return datetime.strptime(value, TIME_FMT).time()
 
 
-def _date_range(start: datetime, end: datetime) -> List[datetime]:
-    days = (end - start).days + 1
-    if days <= 0:
-        raise ValueError("endDate는 startDate보다 같거나 뒤여야 합니다.")
-    return [start + timedelta(days=i) for i in range(days)]
+def _minutes_between_shift_end_and_next_start(end_dt: datetime, next_start_dt: datetime) -> int:
+    return int((next_start_dt - end_dt).total_seconds() // 60)
 
 
-def _shift_duration_hours(start_time: str, end_time: str) -> float:
-    start_dt = _parse_time(start_time)
-    end_dt = _parse_time(end_time)
+def _build_dates(start_date: str, end_date: str) -> List[date]:
+    start = _parse_date(start_date)
+    end = _parse_date(end_date)
+    if end < start:
+        raise ValueError("endDate는 startDate보다 빠를 수 없습니다.")
+    total_days = (end - start).days + 1
+    return [start + timedelta(days=i) for i in range(total_days)]
+
+
+def _build_shift_datetimes(day_value: date, shift: Dict[str, Any]) -> Tuple[datetime, datetime]:
+    start_t = _parse_time(shift["startTime"])
+    end_t = _parse_time(shift["endTime"])
+    start_dt = datetime.combine(day_value, start_t)
+    end_dt = datetime.combine(day_value, end_t)
     if end_dt <= start_dt:
         end_dt += timedelta(days=1)
-    return (end_dt - start_dt).total_seconds() / 3600.0
+    return start_dt, end_dt
 
 
-def _rest_hours_between(prev_shift: Dict[str, Any], next_shift: Dict[str, Any]) -> float:
-    prev_start = _parse_time(prev_shift["startTime"])
-    prev_end = _parse_time(prev_shift["endTime"])
-    next_start = _parse_time(next_shift["startTime"])
-
-    base = datetime(2026, 1, 1)
-    prev_end_dt = base.replace(hour=prev_end.hour, minute=prev_end.minute)
-    prev_start_dt = base.replace(hour=prev_start.hour, minute=prev_start.minute)
-    next_start_dt = (base + timedelta(days=1)).replace(hour=next_start.hour, minute=next_start.minute)
-
-    if prev_end_dt <= prev_start_dt:
-        prev_end_dt += timedelta(days=1)
-
-    return (next_start_dt - prev_end_dt).total_seconds() / 3600.0
-
-
-def _normalize_list(value: Any) -> List[Any]:
-    if value is None:
-        return []
-    if isinstance(value, list):
-        return value
-    return [value]
-
-
-def _employee_has_required(employee: Dict[str, Any], shift: Dict[str, Any]) -> bool:
-    employee_roles = set(_normalize_list(employee.get("roles")))
-    employee_skills = set(_normalize_list(employee.get("skills")))
-
-    required_roles = set(_normalize_list(shift.get("requiredRoles")))
-    required_skills = set(_normalize_list(shift.get("requiredSkills")))
-
-    role_ok = not required_roles or bool(employee_roles & required_roles)
-    skill_ok = required_skills.issubset(employee_skills)
-    allowed_shifts = set(_normalize_list(employee.get("availableShifts")))
-    shift_allowed = not allowed_shifts or shift["name"] in allowed_shifts
-    return role_ok and skill_ok and shift_allowed
-
-
-def _collect_off_dates(employee: Dict[str, Any]) -> set[str]:
-    return set(_normalize_list(employee.get("offDays"))) | set(_normalize_list(employee.get("unavailableDates")))
-
-
-def build_solver_params(input_data: Dict[str, Any]) -> Tuple[Dict[str, Any], List[str]]:
-    start_date = _parse_date(input_data["startDate"])
-    end_date = _parse_date(input_data["endDate"])
-    days = _date_range(start_date, end_date)
-
-    employees = input_data["employees"]
-    shifts = input_data["shifts"]
-    rules = input_data.get("rules", {})
-
-    shift_names = [shift["name"] for shift in shifts]
-    shift_index_by_name = {name: idx for idx, name in enumerate(shift_names)}
-
-    min_rest_hours = int(rules.get("minRestHours", 11))
-    default_max_consecutive_days = int(rules.get("maxConsecutiveDays", 5))
-
-    fixed_offs: List[List[int]] = []
-    preferences: List[List[int]] = []
-    eligible: List[List[List[int]]] = []
-    employee_max_consecutive_days: List[int] = []
-    employee_max_assignments: List[int] = []
-
-    warnings: List[str] = []
-    weekend_day_indices = [idx for idx, day in enumerate(days) if day.weekday() >= 5]
-    night_shift_indices = [idx for idx, shift in enumerate(shifts) if "night" in shift["name"].lower() or shift.get("isNight")]
-
-    for employee in employees:
-        off_dates = _collect_off_dates(employee)
-        fixed_offs.append([
-            idx for idx, day in enumerate(days)
-            if day.strftime(DATE_FMT) in off_dates
-        ])
-
-        preferred_shift_names = set(_normalize_list(employee.get("preferredShifts")))
-        preferences.append([
-            shift_index_by_name[name]
-            for name in preferred_shift_names
-            if name in shift_index_by_name
-        ])
-
-        employee_max_consecutive_days.append(
-            int(employee.get("maxConsecutiveDays", default_max_consecutive_days))
-        )
-        employee_max_assignments.append(
-            int(employee.get("maxAssignments", len(days)))
-        )
-
-        employee_eligibility: List[List[int]] = []
-        for day in days:
-            day_key = day.strftime(DATE_FMT)
-            shift_flags: List[int] = []
-            for shift in shifts:
-                can_work = _employee_has_required(employee, shift) and day_key not in off_dates
-                shift_flags.append(1 if can_work else 0)
-            employee_eligibility.append(shift_flags)
-        eligible.append(employee_eligibility)
-
-    required_staff = [int(shift.get("requiredCount", shift.get("minStaff", 1))) for shift in shifts]
-    shift_hours = [_shift_duration_hours(shift["startTime"], shift["endTime"]) for shift in shifts]
-
-    incompatible_shift_pairs: List[List[int]] = []
-    for prev_s, prev_shift in enumerate(shifts):
-        for next_s, next_shift in enumerate(shifts):
-            rest_hours = _rest_hours_between(prev_shift, next_shift)
-            if rest_hours < min_rest_hours:
-                incompatible_shift_pairs.append([prev_s, next_s])
-
-    precheck_issues: List[Dict[str, Any]] = []
-    for d_idx, day in enumerate(days):
-        for s_idx, shift in enumerate(shifts):
-            candidate_indices = [
-                e_idx for e_idx in range(len(employees))
-                if eligible[e_idx][d_idx][s_idx] == 1
-            ]
-            required_count = required_staff[s_idx]
-            if len(candidate_indices) < required_count:
-                precheck_issues.append({
-                    "date": day.strftime(DATE_FMT),
-                    "shiftName": shift["name"],
-                    "reason": f"정적 후보 부족: 필요 {required_count}명 / 가능 {len(candidate_indices)}명",
-                    "candidateUserIds": [employees[e]["userId"] for e in candidate_indices],
-                })
-            elif len(candidate_indices) == required_count:
-                warnings.append(
-                    f"{day.strftime(DATE_FMT)} {shift['name']}은(는) 후보가 정확히 {required_count}명뿐이라 여유가 없습니다."
-                )
-
-    params = {
-        "num_employees": len(employees),
-        "num_days": len(days),
-        "num_shifts": len(shifts),
-        "shifts": shifts,
-        "shift_names": shift_names,
-        "required_staff": required_staff,
-        "fixed_offs": fixed_offs,
-        "preferences": preferences,
-        "eligible": eligible,
-        "incompatible_shift_pairs": incompatible_shift_pairs,
-        "employee_max_consecutive_days": employee_max_consecutive_days,
-        "employee_max_assignments": employee_max_assignments,
-        "shift_hours": shift_hours,
-        "weekend_day_indices": weekend_day_indices,
-        "night_shift_indices": night_shift_indices,
-        "rules": {
-            "minRestHours": min_rest_hours,
-            "maxConsecutiveDays": default_max_consecutive_days,
-        },
-        "precheck_issues": precheck_issues,
-    }
-    return params, warnings
-
+def _append_reason(reasons: List[Dict[str, Any]], reason: Dict[str, Any], seen: set[tuple]) -> None:
+    key = (
+        reason.get("reasonCode"),
+        reason.get("date"),
+        reason.get("shiftName"),
+        reason.get("employeeId"),
+        reason.get("detail"),
+    )
+    if key not in seen:
+        seen.add(key)
+        reasons.append(reason)
 
 
 def extract_params_node(state: Dict[str, Any]) -> Dict[str, Any]:
-    """LLM 없이 입력 JSON을 deterministic 하게 OR-Tools 파라미터로 변환합니다."""
-    params, warnings = build_solver_params(state["input_json"])
-    return {
-        "solver_params": params,
-        "warnings": warnings,
+    input_json = state["input_json"]
+    rules = input_json.get("rules", {})
+    employees = input_json.get("employees", [])
+    shifts = input_json.get("shifts", [])
+    if not employees:
+        raise ValueError("employees는 비어 있을 수 없습니다.")
+    if not shifts:
+        raise ValueError("shifts는 비어 있을 수 없습니다.")
+
+    dates = _build_dates(input_json["startDate"], input_json["endDate"])
+    date_to_index = {d.strftime(DATE_FMT): idx for idx, d in enumerate(dates)}
+    shift_name_to_index = {shift["name"]: idx for idx, shift in enumerate(shifts)}
+
+    fixed_offs: List[List[int]] = []
+    preferences: List[List[int]] = []
+    employee_roles: List[set[str]] = []
+    employee_skills: List[set[str]] = []
+    employee_available_shifts: List[set[int]] = []
+    employee_max_assignments: List[int] = []
+    employee_max_consecutive_days: List[int] = []
+
+    for employee in employees:
+        off_indices = sorted(date_to_index[d] for d in employee.get("offDays", []) if d in date_to_index)
+        pref_indices = [
+            shift_name_to_index[name]
+            for name in employee.get("preferredShifts", [])
+            if name in shift_name_to_index
+        ]
+        available_shift_names = employee.get("availableShifts", [shift["name"] for shift in shifts])
+        available_shift_indices = {
+            shift_name_to_index[name]
+            for name in available_shift_names
+            if name in shift_name_to_index
+        }
+
+        fixed_offs.append(off_indices)
+        preferences.append(pref_indices)
+        employee_roles.append(set(employee.get("roles", [])))
+        employee_skills.append(set(employee.get("skills", [])))
+        employee_available_shifts.append(available_shift_indices)
+        employee_max_assignments.append(int(employee.get("maxAssignments", len(dates))))
+        employee_max_consecutive_days.append(
+            int(employee.get("maxConsecutiveDays", rules.get("maxConsecutiveDays", len(dates))))
+        )
+
+    shift_required_roles: List[set[str]] = []
+    shift_required_skills: List[set[str]] = []
+    shift_required_counts: List[int] = []
+    shift_is_night: List[bool] = []
+    rest_conflicts: List[Tuple[int, int, int]] = []
+    day_to_is_weekend = [1 if d.weekday() >= 5 else 0 for d in dates]
+    min_rest_hours = int(rules.get("minRestHours", 11))
+
+    for shift in shifts:
+        shift_required_roles.append(set(shift.get("requiredRoles", [])))
+        shift_required_skills.append(set(shift.get("requiredSkills", [])))
+        shift_required_counts.append(int(shift.get("requiredCount", shift.get("minStaff", 1))))
+        shift_is_night.append(bool(shift.get("isNight", False)))
+
+    for day_idx in range(len(dates) - 1):
+        current_day = dates[day_idx]
+        next_day = dates[day_idx + 1]
+        for s1_idx, shift_1 in enumerate(shifts):
+            _, end_dt = _build_shift_datetimes(current_day, shift_1)
+            for s2_idx, shift_2 in enumerate(shifts):
+                next_start_dt, _ = _build_shift_datetimes(next_day, shift_2)
+                rest_hours = _minutes_between_shift_end_and_next_start(end_dt, next_start_dt) / 60
+                if rest_hours < min_rest_hours:
+                    rest_conflicts.append((day_idx, s1_idx, s2_idx))
+
+    eligibility = []
+    infeasible_reasons: List[Dict[str, Any]] = []
+    seen_reasons: set[tuple] = set()
+    for e_idx, employee in enumerate(employees):
+        per_day = []
+        for d_idx, day_value in enumerate(dates):
+            per_shift = []
+            for s_idx, shift in enumerate(shifts):
+                allowed = True
+                block_reasons = []
+                if d_idx in fixed_offs[e_idx]:
+                    allowed = False
+                    block_reasons.append("offDay")
+                if s_idx not in employee_available_shifts[e_idx]:
+                    allowed = False
+                    block_reasons.append("availableShifts")
+                if shift_required_roles[s_idx] and not shift_required_roles[s_idx].issubset(employee_roles[e_idx]):
+                    allowed = False
+                    block_reasons.append("requiredRoles")
+                if shift_required_skills[s_idx] and not shift_required_skills[s_idx].issubset(employee_skills[e_idx]):
+                    allowed = False
+                    block_reasons.append("requiredSkills")
+                per_shift.append(allowed)
+            per_day.append(per_shift)
+        eligibility.append(per_day)
+
+    total_required_assignments = sum(shift_required_counts) * len(dates)
+    total_capacity = sum(employee_max_assignments)
+    if total_capacity < total_required_assignments:
+        _append_reason(
+            infeasible_reasons,
+            {
+                "reasonCode": "TOTAL_CAPACITY_SHORTAGE",
+                "detail": (
+                    f"총 필요 배정 {total_required_assignments}건 > 직원 최대 배정 가능 합 {total_capacity}건"
+                ),
+                "requiredAssignments": total_required_assignments,
+                "maxAssignable": total_capacity,
+            },
+            seen_reasons,
+        )
+
+    for d_idx, day_value in enumerate(dates):
+        day_label = day_value.strftime(DATE_FMT)
+        for s_idx, shift in enumerate(shifts):
+            eligible_employee_indices = [
+                e_idx for e_idx in range(len(employees)) if eligibility[e_idx][d_idx][s_idx]
+            ]
+            eligible_count = len(eligible_employee_indices)
+            if eligible_count < shift_required_counts[s_idx]:
+                _append_reason(
+                    infeasible_reasons,
+                    {
+                        "reasonCode": "DAY_SHIFT_ELIGIBILITY_SHORTAGE",
+                        "date": day_label,
+                        "shiftName": shift["name"],
+                        "detail": f"가능 인원 {eligible_count}명 / 필요 인원 {shift_required_counts[s_idx]}명",
+                        "requiredCount": shift_required_counts[s_idx],
+                        "eligibleCount": eligible_count,
+                        "eligibleEmployees": [
+                            {
+                                "userId": employees[e_idx]["userId"],
+                                "userName": employees[e_idx]["userName"],
+                            }
+                            for e_idx in eligible_employee_indices
+                        ],
+                    },
+                    seen_reasons,
+                )
+
+    for s_idx, shift in enumerate(shifts):
+        total_shift_demand = shift_required_counts[s_idx] * len(dates)
+        eligible_employee_indices = []
+        total_shift_capacity = 0
+        for e_idx, employee in enumerate(employees):
+            can_work_this_shift_some_day = any(eligibility[e_idx][d][s_idx] for d in range(len(dates)))
+            if can_work_this_shift_some_day:
+                eligible_employee_indices.append(e_idx)
+                available_days_for_shift = sum(1 for d in range(len(dates)) if eligibility[e_idx][d][s_idx])
+                total_shift_capacity += min(employee_max_assignments[e_idx], available_days_for_shift)
+
+        if total_shift_capacity < total_shift_demand:
+            _append_reason(
+                infeasible_reasons,
+                {
+                    "reasonCode": "SHIFT_CAPACITY_SHORTAGE",
+                    "shiftName": shift["name"],
+                    "detail": (
+                        f"'{shift['name']}' 전체 수요 {total_shift_demand}건 > 자격 보유 인원의 최대 수용량 {total_shift_capacity}건"
+                    ),
+                    "requiredAssignments": total_shift_demand,
+                    "maxAssignable": total_shift_capacity,
+                    "eligibleEmployees": [
+                        {
+                            "userId": employees[e_idx]["userId"],
+                            "userName": employees[e_idx]["userName"],
+                            "maxAssignments": employee_max_assignments[e_idx],
+                        }
+                        for e_idx in eligible_employee_indices
+                    ],
+                },
+                seen_reasons,
+            )
+
+    for e_idx, employee in enumerate(employees):
+        fixed_off_count = len(fixed_offs[e_idx])
+        available_days_after_off = len(dates) - fixed_off_count
+        hard_upper_bound = min(employee_max_assignments[e_idx], available_days_after_off)
+        if hard_upper_bound <= 0:
+            _append_reason(
+                infeasible_reasons,
+                {
+                    "reasonCode": "EMPLOYEE_ZERO_CAPACITY",
+                    "employeeId": employee["userId"],
+                    "employeeName": employee["userName"],
+                    "detail": "휴무일과 최대 배정 수 조건으로 인해 배정 가능량이 0건입니다.",
+                },
+                seen_reasons,
+            )
+
+    solver_params = {
+        "start_date": input_json["startDate"],
+        "end_date": input_json["endDate"],
+        "num_employees": len(employees),
+        "num_days": len(dates),
+        "num_shifts": len(shifts),
+        "dates": [d.strftime(DATE_FMT) for d in dates],
+        "day_to_is_weekend": day_to_is_weekend,
+        "shifts": shifts,
+        "fixed_offs": fixed_offs,
+        "preferences": preferences,
+        "eligibility": eligibility,
+        "rest_conflicts": rest_conflicts,
+        "shift_required_counts": shift_required_counts,
+        "shift_is_night": shift_is_night,
+        "employee_max_assignments": employee_max_assignments,
+        "employee_max_consecutive_days": employee_max_consecutive_days,
+        "weights": {
+            "fairness": int(rules.get("fairnessWeight", 4)),
+            "preference": int(rules.get("preferenceWeight", 3)),
+            "weekend": int(rules.get("weekendWeight", 2)),
+            "night": int(rules.get("nightWeight", 3)),
+        },
+        "solver_time_limit_seconds": int(rules.get("solverTimeLimitSeconds", 10)),
+        "precheck_infeasible_reasons": infeasible_reasons,
     }
+    return {"solver_params": solver_params}
 
 
 
 def solve_node(state: Dict[str, Any]) -> Dict[str, Any]:
-    """OR-Tools를 호출해 스케줄을 생성하거나 실패 사유를 반환합니다."""
-    solve_result = solve_shift_optimization(state["solver_params"])
-    if solve_result["status"] != "SUCCESS":
-        return {
-            "error_msg": solve_result["message"],
-            "solve_result": solve_result,
-        }
-    return {
-        "raw_schedule": solve_result["assignments"],
-        "solve_result": solve_result,
-    }
+    result = solve_shift_optimization(state["solver_params"])
+    if result["status"] == "FAILED":
+        return {"error_msg": result["message"], "raw_schedule": result}
+    return {"raw_schedule": result}
 
 
 
 def format_node(state: Dict[str, Any]) -> Dict[str, Any]:
-    """최종 API 응답 형태로 포맷팅합니다."""
+    raw_result = state["raw_schedule"]
     input_json = state["input_json"]
-    solver_params = state["solver_params"]
-    solve_result = state["solve_result"]
-    warnings = list(state.get("warnings", []))
-    warnings.extend(solve_result.get("warnings", []))
-
     employees = input_json["employees"]
     shifts = input_json["shifts"]
-    start_date = _parse_date(input_json["startDate"])
 
     assignments = []
-    for item in solve_result.get("assignments", []):
-        day_index = item["day_index"]
-        employee_index = item["employee_index"]
-        shift_index = item["shift_index"]
-
-        date_str = (start_date + timedelta(days=day_index)).strftime(DATE_FMT)
-        employee = employees[employee_index]
-        shift = shifts[shift_index]
-        assignments.append({
-            "date": date_str,
-            "userId": employee["userId"],
-            "userName": employee["userName"],
-            "shiftName": shift["name"],
-            "startTime": shift["startTime"],
-            "endTime": shift["endTime"],
-        })
-
-    assignments.sort(key=lambda x: (x["date"], x["shiftName"], x["userId"]))
+    for item in raw_result["assignments"]:
+        employee = employees[item["employee_index"]]
+        shift = shifts[item["shift_index"]]
+        assignments.append(
+            {
+                "date": item["date"],
+                "userId": employee["userId"],
+                "userName": employee["userName"],
+                "shiftName": shift["name"],
+                "startTime": shift["startTime"],
+                "endTime": shift["endTime"],
+            }
+        )
 
     final_schedule = {
-        "status": solve_result["status"],
-        "message": solve_result["message"],
-        "period": {
-            "startDate": input_json["startDate"],
-            "endDate": input_json["endDate"],
-        },
-        "appliedRules": solver_params["rules"],
+        "status": raw_result["status"],
+        "message": raw_result["message"],
         "assignments": assignments,
-        "summary": solve_result.get("summary", {}),
-        "fairness": solve_result.get("fairness", {}),
-        "warnings": warnings,
-        "unassignedShifts": solve_result.get("unassignedShifts", []),
+        "fairnessSummary": raw_result.get("fairness_summary", {}),
+        "warnings": raw_result.get("warnings", []),
+        "solverMeta": raw_result.get("solver_meta", {}),
+        "unassignedShifts": raw_result.get("unassigned_shifts", []),
     }
     return {"final_schedule": final_schedule}
