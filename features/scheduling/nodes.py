@@ -3,7 +3,7 @@ from __future__ import annotations
 from datetime import date, datetime, time, timedelta
 from typing import Any, Dict, List, Tuple
 
-from solver import solve_shift_optimization
+from scheduling.solver import solve_shift_optimization
 
 
 DATE_FMT = "%Y-%m-%d"
