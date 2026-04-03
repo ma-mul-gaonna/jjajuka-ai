@@ -7,7 +7,7 @@ from langgraph.graph import END, StateGraph
 
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 
-from scheduling.nodes import extract_params_node, format_node, solve_node
+from features.scheduling.nodes import extract_params_node, format_node, solve_node
 
 
 class AgentState(TypedDict):
