@@ -4,14 +4,31 @@ import sys
 from typing import Any, Dict, List, Optional, TypedDict
 
 from langgraph.graph import END, StateGraph
+from dotenv import load_dotenv
+
+load_dotenv()
 
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 
-from features.scheduling.nodes import extract_params_node, format_node, solve_node
+from features.scheduling.nodes import (
+    llm_parse_node,
+    extract_params_node,
+    solve_node,
+    format_node,
+    explain_node,
+)
 
 
 class AgentState(TypedDict):
     input_json: Dict[str, Any]
+    user_request: Optional[str]
+
+    constraint_catalog: Dict[str, Any]
+    llm_parse_result: Dict[str, Any]
+    parser_warnings: List[Dict[str, Any]]
+    applied_instructions: List[Dict[str, Any]]
+    ignored_instructions: List[Dict[str, Any]]
+
     solver_params: Dict[str, Any]
     raw_schedule: Dict[str, Any]
     final_schedule: Dict[str, Any]
@@ -19,10 +36,15 @@ class AgentState(TypedDict):
 
 
 workflow = StateGraph(AgentState)
+
+workflow.add_node("llm_parse", llm_parse_node)
 workflow.add_node("extract", extract_params_node)
 workflow.add_node("solve", solve_node)
 workflow.add_node("format", format_node)
-workflow.set_entry_point("extract")
+workflow.add_node("explain", explain_node)
+
+workflow.set_entry_point("llm_parse")
+workflow.add_edge("llm_parse", "extract")
 workflow.add_edge("extract", "solve")
 
 
@@ -38,7 +60,10 @@ workflow.add_conditional_edges(
         "end": END,
     },
 )
-workflow.add_edge("format", END)
+
+workflow.add_edge("format", "explain")
+workflow.add_edge("explain", END)
+
 app = workflow.compile()
 
 
@@ -49,6 +74,7 @@ if __name__ == "__main__":
         "rules": {
             "minRestHours": 11,
             "maxConsecutiveDays": 5,
+            "maxShiftsPerDay": 1,
             "fairnessWeight": 4,
             "preferenceWeight": 3,
             "weekendWeight": 2,
@@ -157,6 +183,12 @@ if __name__ == "__main__":
     result = app.invoke(
         {
             "input_json": sample_input,
+            "user_request": "김민지는 2026-04-10 쉬게 하고, 김민지 Night 금지하고, 나머지 야간은 최대한 공평하게 해줘. 하루 최대 1개 시프트만 유지해줘. 분위기 좋게 짜줘.",
+            "constraint_catalog": {},
+            "llm_parse_result": {},
+            "parser_warnings": [],
+            "applied_instructions": [],
+            "ignored_instructions": [],
             "solver_params": {},
             "raw_schedule": {},
             "final_schedule": {},

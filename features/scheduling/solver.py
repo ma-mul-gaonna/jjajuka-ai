@@ -79,17 +79,21 @@ def solve_shift_optimization(params: Dict[str, Any]) -> Dict[str, Any]:
     shift_required_counts = params["shift_required_counts"]
     rest_conflicts = params["rest_conflicts"]
     employee_max_assignments = params["employee_max_assignments"]
+    employee_forbidden_shifts = params.get(
+        "employee_forbidden_shifts",
+        [set() for _ in range(num_employees)]
+    )
     employee_max_consecutive_days = params["employee_max_consecutive_days"]
     preferences = params["preferences"]
     day_to_is_weekend = params["day_to_is_weekend"]
     shift_is_night = params["shift_is_night"]
     weights = params["weights"]
     time_limit_seconds = params["solver_time_limit_seconds"]
+    max_shifts_per_day = params.get("max_shifts_per_day", 1)
 
     night_shift_indices = [s for s in range(num_shifts) if shift_is_night[s]]
     total_night_slots = num_days * sum(shift_required_counts[s] for s in night_shift_indices)
 
-    # eligibility 기반으로 실제 Night 가능 인원 재계산
     night_eligible_employees: List[int] = []
     for e in range(num_employees):
         if any(
@@ -112,10 +116,15 @@ def solve_shift_optimization(params: Dict[str, Any]) -> Dict[str, Any]:
 
     for e in range(num_employees):
         for d in range(num_days):
+            for s in employee_forbidden_shifts[e]:
+                model.Add(work[(e, d, s)] == 0)
+
+    for e in range(num_employees):
+        for d in range(num_days):
             works_day[(e, d)] = model.NewBoolVar(f"works_day_e{e}_d{d}")
             daily_sum = sum(work[(e, d, s)] for s in range(num_shifts))
-            model.Add(daily_sum <= 1)
-            model.Add(daily_sum == works_day[(e, d)])
+            model.Add(daily_sum <= max_shifts_per_day)
+            model.AddMaxEquality(works_day[(e, d)], [work[(e, d, s)] for s in range(num_shifts)])
 
     for d in range(num_days):
         for s in range(num_shifts):
@@ -143,12 +152,12 @@ def solve_shift_optimization(params: Dict[str, Any]) -> Dict[str, Any]:
     preference_hits = []
 
     for e in range(num_employees):
-        total_var = model.NewIntVar(0, num_days, f"total_e{e}")
+        total_var = model.NewIntVar(0, num_days * max_shifts_per_day, f"total_e{e}")
         night_var = model.NewIntVar(0, total_night_slots, f"night_e{e}")
-        weekend_var = model.NewIntVar(0, num_days, f"weekend_e{e}")
-        pref_var = model.NewIntVar(0, num_days, f"pref_e{e}")
+        weekend_var = model.NewIntVar(0, num_days * max_shifts_per_day, f"weekend_e{e}")
+        pref_var = model.NewIntVar(0, num_days * max_shifts_per_day, f"pref_e{e}")
 
-        model.Add(total_var == sum(works_day[(e, d)] for d in range(num_days)))
+        model.Add(total_var == sum(work[(e, d, s)] for d in range(num_days) for s in range(num_shifts)))
         model.Add(
             night_var
             == sum(
@@ -182,22 +191,21 @@ def solve_shift_optimization(params: Dict[str, Any]) -> Dict[str, Any]:
         weekend_assignments.append(weekend_var)
         preference_hits.append(pref_var)
 
-    total_max = model.NewIntVar(0, num_days, "total_max")
-    total_min = model.NewIntVar(0, num_days, "total_min")
-    weekend_max = model.NewIntVar(0, num_days, "weekend_max")
-    weekend_min = model.NewIntVar(0, num_days, "weekend_min")
+    total_max = model.NewIntVar(0, num_days * max_shifts_per_day, "total_max")
+    total_min = model.NewIntVar(0, num_days * max_shifts_per_day, "total_min")
+    weekend_max = model.NewIntVar(0, num_days * max_shifts_per_day, "weekend_max")
+    weekend_min = model.NewIntVar(0, num_days * max_shifts_per_day, "weekend_min")
 
     model.AddMaxEquality(total_max, total_assignments)
     model.AddMinEquality(total_min, total_assignments)
     model.AddMaxEquality(weekend_max, weekend_assignments)
     model.AddMinEquality(weekend_min, weekend_assignments)
 
-    total_spread = model.NewIntVar(0, num_days, "total_spread")
-    weekend_spread = model.NewIntVar(0, num_days, "weekend_spread")
+    total_spread = model.NewIntVar(0, num_days * max_shifts_per_day, "total_spread")
+    weekend_spread = model.NewIntVar(0, num_days * max_shifts_per_day, "weekend_spread")
     model.Add(total_spread == total_max - total_min)
     model.Add(weekend_spread == weekend_max - weekend_min)
 
-    # Night fairness: Night eligible 직원 집합만 대상으로 강하게 분산
     night_fairness_penalty_terms = []
     night_spread_eligible = None
 
@@ -284,6 +292,7 @@ def solve_shift_optimization(params: Dict[str, Any]) -> Dict[str, Any]:
         "timeLimitSeconds": time_limit_seconds,
         "nightEligibleEmployeeIndices": night_eligible_employees,
         "nightEligibleCount": len(night_eligible_employees),
+        "maxShiftsPerDay": max_shifts_per_day,
     }
     if night_spread_eligible is not None:
         solver_meta["nightSpreadEligibleOnly"] = solver.Value(night_spread_eligible)
