@@ -3,6 +3,10 @@ from __future__ import annotations
 from datetime import date, datetime, time, timedelta
 from typing import Any, Dict, List, Tuple
 
+from features.scheduling.catalog import build_constraint_catalog
+from features.scheduling.explain import generate_explanation
+from features.scheduling.merge import apply_llm_overrides
+from features.scheduling.parser import parse_user_request
 from features.scheduling.solver import solve_shift_optimization
 
 
@@ -54,6 +58,24 @@ def _append_reason(reasons: List[Dict[str, Any]], reason: Dict[str, Any], seen: 
         reasons.append(reason)
 
 
+def llm_parse_node(state: Dict[str, Any]) -> Dict[str, Any]:
+    base_input = state["input_json"]
+    user_request = state.get("user_request")
+
+    constraint_catalog = build_constraint_catalog()
+    parse_result = parse_user_request(user_request, base_input)
+    merged_input, applied, ignored, warnings = apply_llm_overrides(base_input, parse_result)
+
+    return {
+        "constraint_catalog": constraint_catalog,
+        "input_json": merged_input,
+        "llm_parse_result": parse_result,
+        "applied_instructions": applied,
+        "ignored_instructions": ignored,
+        "parser_warnings": warnings,
+    }
+
+
 def extract_params_node(state: Dict[str, Any]) -> Dict[str, Any]:
     input_json = state["input_json"]
     rules = input_json.get("rules", {})
@@ -73,6 +95,7 @@ def extract_params_node(state: Dict[str, Any]) -> Dict[str, Any]:
     employee_roles: List[set[str]] = []
     employee_skills: List[set[str]] = []
     employee_available_shifts: List[set[int]] = []
+    employee_forbidden_shifts: List[set[int]] = []
     employee_max_assignments: List[int] = []
     employee_max_consecutive_days: List[int] = []
 
@@ -89,6 +112,12 @@ def extract_params_node(state: Dict[str, Any]) -> Dict[str, Any]:
             for name in available_shift_names
             if name in shift_name_to_index
         }
+        forbidden_shift_names = employee.get("forbiddenShifts", [])
+        forbidden_shift_indices = {
+            shift_name_to_index[name]
+            for name in forbidden_shift_names
+            if name in shift_name_to_index
+        }
 
         fixed_offs.append(off_indices)
         preferences.append(pref_indices)
@@ -99,6 +128,8 @@ def extract_params_node(state: Dict[str, Any]) -> Dict[str, Any]:
         employee_max_consecutive_days.append(
             int(employee.get("maxConsecutiveDays", rules.get("maxConsecutiveDays", len(dates))))
         )
+        employee_available_shifts.append(available_shift_indices)
+        employee_forbidden_shifts.append(forbidden_shift_indices)
 
     shift_required_roles: List[set[str]] = []
     shift_required_skills: List[set[str]] = []
@@ -107,6 +138,7 @@ def extract_params_node(state: Dict[str, Any]) -> Dict[str, Any]:
     rest_conflicts: List[Tuple[int, int, int]] = []
     day_to_is_weekend = [1 if d.weekday() >= 5 else 0 for d in dates]
     min_rest_hours = int(rules.get("minRestHours", 11))
+    max_shifts_per_day = int(rules.get("maxShiftsPerDay", 1))
 
     for shift in shifts:
         shift_required_roles.append(set(shift.get("requiredRoles", [])))
@@ -128,25 +160,23 @@ def extract_params_node(state: Dict[str, Any]) -> Dict[str, Any]:
     eligibility = []
     infeasible_reasons: List[Dict[str, Any]] = []
     seen_reasons: set[tuple] = set()
+
     for e_idx, employee in enumerate(employees):
         per_day = []
-        for d_idx, day_value in enumerate(dates):
+        for d_idx, _ in enumerate(dates):
             per_shift = []
-            for s_idx, shift in enumerate(shifts):
+            for s_idx, _ in enumerate(shifts):
                 allowed = True
-                block_reasons = []
                 if d_idx in fixed_offs[e_idx]:
                     allowed = False
-                    block_reasons.append("offDay")
                 if s_idx not in employee_available_shifts[e_idx]:
                     allowed = False
-                    block_reasons.append("availableShifts")
+                if s_idx in employee_forbidden_shifts[e_idx]:
+                    allowed = False
                 if shift_required_roles[s_idx] and not shift_required_roles[s_idx].issubset(employee_roles[e_idx]):
                     allowed = False
-                    block_reasons.append("requiredRoles")
                 if shift_required_skills[s_idx] and not shift_required_skills[s_idx].issubset(employee_skills[e_idx]):
                     allowed = False
-                    block_reasons.append("requiredSkills")
                 per_shift.append(allowed)
             per_day.append(per_shift)
         eligibility.append(per_day)
@@ -158,9 +188,7 @@ def extract_params_node(state: Dict[str, Any]) -> Dict[str, Any]:
             infeasible_reasons,
             {
                 "reasonCode": "TOTAL_CAPACITY_SHORTAGE",
-                "detail": (
-                    f"총 필요 배정 {total_required_assignments}건 > 직원 최대 배정 가능 합 {total_capacity}건"
-                ),
+                "detail": f"총 필요 배정 {total_required_assignments}건 > 직원 최대 배정 가능 합 {total_capacity}건",
                 "requiredAssignments": total_required_assignments,
                 "maxAssignable": total_capacity,
             },
@@ -184,66 +212,9 @@ def extract_params_node(state: Dict[str, Any]) -> Dict[str, Any]:
                         "detail": f"가능 인원 {eligible_count}명 / 필요 인원 {shift_required_counts[s_idx]}명",
                         "requiredCount": shift_required_counts[s_idx],
                         "eligibleCount": eligible_count,
-                        "eligibleEmployees": [
-                            {
-                                "userId": employees[e_idx]["userId"],
-                                "userName": employees[e_idx]["userName"],
-                            }
-                            for e_idx in eligible_employee_indices
-                        ],
                     },
                     seen_reasons,
                 )
-
-    for s_idx, shift in enumerate(shifts):
-        total_shift_demand = shift_required_counts[s_idx] * len(dates)
-        eligible_employee_indices = []
-        total_shift_capacity = 0
-        for e_idx, employee in enumerate(employees):
-            can_work_this_shift_some_day = any(eligibility[e_idx][d][s_idx] for d in range(len(dates)))
-            if can_work_this_shift_some_day:
-                eligible_employee_indices.append(e_idx)
-                available_days_for_shift = sum(1 for d in range(len(dates)) if eligibility[e_idx][d][s_idx])
-                total_shift_capacity += min(employee_max_assignments[e_idx], available_days_for_shift)
-
-        if total_shift_capacity < total_shift_demand:
-            _append_reason(
-                infeasible_reasons,
-                {
-                    "reasonCode": "SHIFT_CAPACITY_SHORTAGE",
-                    "shiftName": shift["name"],
-                    "detail": (
-                        f"'{shift['name']}' 전체 수요 {total_shift_demand}건 > 자격 보유 인원의 최대 수용량 {total_shift_capacity}건"
-                    ),
-                    "requiredAssignments": total_shift_demand,
-                    "maxAssignable": total_shift_capacity,
-                    "eligibleEmployees": [
-                        {
-                            "userId": employees[e_idx]["userId"],
-                            "userName": employees[e_idx]["userName"],
-                            "maxAssignments": employee_max_assignments[e_idx],
-                        }
-                        for e_idx in eligible_employee_indices
-                    ],
-                },
-                seen_reasons,
-            )
-
-    for e_idx, employee in enumerate(employees):
-        fixed_off_count = len(fixed_offs[e_idx])
-        available_days_after_off = len(dates) - fixed_off_count
-        hard_upper_bound = min(employee_max_assignments[e_idx], available_days_after_off)
-        if hard_upper_bound <= 0:
-            _append_reason(
-                infeasible_reasons,
-                {
-                    "reasonCode": "EMPLOYEE_ZERO_CAPACITY",
-                    "employeeId": employee["userId"],
-                    "employeeName": employee["userName"],
-                    "detail": "휴무일과 최대 배정 수 조건으로 인해 배정 가능량이 0건입니다.",
-                },
-                seen_reasons,
-            )
 
     solver_params = {
         "start_date": input_json["startDate"],
@@ -258,10 +229,12 @@ def extract_params_node(state: Dict[str, Any]) -> Dict[str, Any]:
         "preferences": preferences,
         "eligibility": eligibility,
         "rest_conflicts": rest_conflicts,
+        "employee_forbidden_shifts": employee_forbidden_shifts,
         "shift_required_counts": shift_required_counts,
         "shift_is_night": shift_is_night,
         "employee_max_assignments": employee_max_assignments,
         "employee_max_consecutive_days": employee_max_consecutive_days,
+        "max_shifts_per_day": max_shifts_per_day,
         "weights": {
             "fairness": int(rules.get("fairnessWeight", 4)),
             "preference": int(rules.get("preferenceWeight", 3)),
@@ -274,13 +247,11 @@ def extract_params_node(state: Dict[str, Any]) -> Dict[str, Any]:
     return {"solver_params": solver_params}
 
 
-
 def solve_node(state: Dict[str, Any]) -> Dict[str, Any]:
     result = solve_shift_optimization(state["solver_params"])
     if result["status"] == "FAILED":
         return {"error_msg": result["message"], "raw_schedule": result}
     return {"raw_schedule": result}
-
 
 
 def format_node(state: Dict[str, Any]) -> Dict[str, Any]:
@@ -312,5 +283,23 @@ def format_node(state: Dict[str, Any]) -> Dict[str, Any]:
         "warnings": raw_result.get("warnings", []),
         "solverMeta": raw_result.get("solver_meta", {}),
         "unassignedShifts": raw_result.get("unassigned_shifts", []),
+        "appliedInstructions": state.get("applied_instructions", []),
+        "ignoredInstructions": state.get("ignored_instructions", []),
+        "parserWarnings": state.get("parser_warnings", []),
+        "constraintCatalog": state.get("constraint_catalog", {}),
+        "parserMode": state.get("llm_parse_result", {}).get("mode", "unknown"),
     }
+    return {"final_schedule": final_schedule}
+
+
+def explain_node(state: Dict[str, Any]) -> Dict[str, Any]:
+    explanation = generate_explanation(
+        raw_result=state["raw_schedule"],
+        input_json=state["input_json"],
+        applied_instructions=state.get("applied_instructions", []),
+        ignored_instructions=state.get("ignored_instructions", []),
+        parser_warnings=state.get("parser_warnings", []),
+    )
+    final_schedule = state["final_schedule"]
+    final_schedule["explanation"] = explanation
     return {"final_schedule": final_schedule}
