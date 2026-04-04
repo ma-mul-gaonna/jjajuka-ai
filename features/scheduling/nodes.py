@@ -244,7 +244,7 @@ def extract_params_node(state: Dict[str, Any]) -> Dict[str, Any]:
             "weekend": int(rules.get("weekendWeight", 2)),
             "night": int(rules.get("nightWeight", 3)),
         },
-        "solver_time_limit_seconds": int(rules.get("solverTimeLimitSeconds", 10)),
+        "solver_time_limit_seconds": int(rules.get("solverTimeLimitSeconds", 15)),
         "precheck_infeasible_reasons": infeasible_reasons,
         "shift_min_skill_coverage": shift_min_skill_coverage,
         "employees": employees,
