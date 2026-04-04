@@ -261,6 +261,36 @@ def apply_llm_overrides(
             )
             continue
 
+        if inst_type == "SET_ALL_SHIFTS_MIN_SKILL_COVERAGE":
+            skill = inst.get("skill")
+            count = inst.get("count")
+
+            if not skill or not isinstance(count, int) or count < 1:
+                ignored.append(
+                    {
+                        "instruction": inst,
+                        "reasonCode": "INVALID_MIN_SKILL_COVERAGE",
+                        "reason": "skill 또는 count가 유효하지 않습니다.",
+                    }
+                )
+                continue
+
+            for shift in merged.get("shifts", []):
+                coverage = shift.setdefault("minSkillCoverage", [])
+                exists = any(c.get("skill") == skill for c in coverage)
+                if not exists:
+                    coverage.append({"skill": skill, "count": count})
+
+            applied.append(
+                {
+                    "type": inst_type,
+                    "skill": skill,
+                    "count": count,
+                    "message": f"모든 시프트에 {skill} 최소 {count}명 이상 배치",
+                }
+            )
+            continue
+        
         ignored.append(
             {
                 "instruction": inst,

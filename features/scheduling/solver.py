@@ -90,7 +90,9 @@ def solve_shift_optimization(params: Dict[str, Any]) -> Dict[str, Any]:
     weights = params["weights"]
     time_limit_seconds = params["solver_time_limit_seconds"]
     max_shifts_per_day = params.get("max_shifts_per_day", 1)
-
+    shift_min_skill_coverage = params.get("shift_min_skill_coverage", [])
+    employees = params.get("employees", [])
+    employee_skills = [set(e.get("skills", [])) for e in employees]
     night_shift_indices = [s for s in range(num_shifts) if shift_is_night[s]]
     total_night_slots = num_days * sum(shift_required_counts[s] for s in night_shift_indices)
 
@@ -145,6 +147,19 @@ def solve_shift_optimization(params: Dict[str, Any]) -> Dict[str, Any]:
     for e in range(num_employees):
         for d, s1, s2 in rest_conflicts:
             model.Add(work[(e, d, s1)] + work[(e, d + 1, s2)] <= 1)
+
+    for d in range(num_days):
+        for s in range(num_shifts):
+            for rule in shift_min_skill_coverage[s]:
+                skill = rule["skill"]
+                count = int(rule["count"])
+
+                eligible_with_skill = [
+                    work[(e, d, s)]
+                    for e in range(num_employees)
+                    if skill in employee_skills[e]
+                ]
+                model.Add(sum(eligible_with_skill) >= count)
 
     total_assignments = []
     night_assignments = []
