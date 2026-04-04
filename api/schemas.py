@@ -38,3 +38,49 @@ class ScheduleResponse(BaseModel):
     constraintCatalog: Dict[str, Any] = Field(default_factory=dict)
     parserMode: str = "unknown"
     explanation: Optional[ExplanationResponse] = None
+
+class ReplacementAbsenceRequest(BaseModel):
+    userId: int
+    date: str
+    shiftName: str
+
+
+class SimpleAssignmentRequest(BaseModel):
+    date: str
+    userId: int
+    userName: str
+    shiftName: str
+
+
+class CurrentScheduleRequest(BaseModel):
+    assignments: List[SimpleAssignmentRequest] = Field(default_factory=list)
+
+
+class ReplacementRecommendationRequest(BaseModel):
+    input_json: Dict[str, Any]
+    current_schedule: CurrentScheduleRequest
+    absence: ReplacementAbsenceRequest
+    user_request: List[str] = Field(default_factory=list)
+
+
+class ReplacementCandidateResponse(BaseModel):
+    rank: int
+    userId: int
+    userName: str
+    score: int
+    reasons: List[str] = Field(default_factory=list)
+
+
+class ReplacementAbsenceResponse(BaseModel):
+    userId: int
+    userName: str
+    date: str
+    shiftName: str
+
+
+class ReplacementRecommendationResponse(BaseModel):
+    status: str
+    message: str
+    absence: ReplacementAbsenceResponse
+    recommendations: List[ReplacementCandidateResponse] = Field(default_factory=list)
+    warnings: List[str] = Field(default_factory=list)

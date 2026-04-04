@@ -1,6 +1,7 @@
 from typing import Any, Dict, Optional, List
 
 from app.graph import graph_app
+from features.recommendation.replacement_recommender import recommend_replacements
 
 
 def run_schedule(input_json: Dict[str, Any], user_request: Optional[str | List[str]] = None) -> Dict[str, Any]:
@@ -27,3 +28,16 @@ def run_schedule(input_json: Dict[str, Any], user_request: Optional[str | List[s
         }
 
     return result["final_schedule"]
+
+def run_replacement_recommendation(
+    input_json: Dict[str, Any],
+    current_schedule: Dict[str, Any],
+    absence: Dict[str, Any],
+    user_request: Optional[List[str] | str] = None,
+) -> Dict[str, Any]:
+    return recommend_replacements(
+        input_json=input_json,
+        current_schedule=current_schedule,
+        absence=absence,
+        user_request=user_request,
+    )
