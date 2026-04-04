@@ -64,6 +64,11 @@ def build_constraint_catalog() -> Dict[str, Any]:
                 "type": "LIMIT_NIGHT_ASSIGNMENTS",
                 "description": "특정 직원의 야간 근무 최대 횟수 제한",
                 "required_fields": ["userId", "value"],
+            },
+            {
+                "type": "SET_ALL_SHIFTS_MIN_SKILL_COVERAGE",
+                "description": "모든 시프트에 특정 스킬 보유 인원을 최소 N명 이상 배치",
+                "required_fields": ["skill", "count"],
             }
 
         ],

@@ -348,6 +348,18 @@ def _fallback_parse(user_request: str, input_json: Dict[str, Any]) -> Dict[str, 
                         "sourceText": match.group(0),
                     }
                 )
+    if ("모든 근무" in user_request or "각 시프트" in user_request) and "GRADE_A" in user_request:
+        m = re.search(r"(최소|이상)\s*(\d+)명", user_request)
+        count = int(m.group(2)) if m else 1
+        instructions.append(
+            {
+                "type": "SET_ALL_SHIFTS_MIN_SKILL_COVERAGE",
+                "supported": True,
+                "skill": "GRADE_A",
+                "count": count,
+                "sourceText": user_request,
+            }
+        )
 
     unsupported_keywords = ["분위기 좋게", "인간적으로", "덜 힘들게", "잘 맞는 사람끼리"]
     for keyword in unsupported_keywords:

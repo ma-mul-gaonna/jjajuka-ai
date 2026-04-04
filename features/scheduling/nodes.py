@@ -139,6 +139,7 @@ def extract_params_node(state: Dict[str, Any]) -> Dict[str, Any]:
     day_to_is_weekend = [1 if d.weekday() >= 5 else 0 for d in dates]
     min_rest_hours = int(rules.get("minRestHours", 11))
     max_shifts_per_day = int(rules.get("maxShiftsPerDay", 1))
+    shift_min_skill_coverage = []
 
     for shift in shifts:
         shift_required_roles.append(set(shift.get("requiredRoles", [])))
@@ -216,6 +217,9 @@ def extract_params_node(state: Dict[str, Any]) -> Dict[str, Any]:
                     seen_reasons,
                 )
 
+    for shift in shifts:
+        shift_min_skill_coverage.append(shift.get("minSkillCoverage", []))
+
     solver_params = {
         "start_date": input_json["startDate"],
         "end_date": input_json["endDate"],
@@ -243,6 +247,8 @@ def extract_params_node(state: Dict[str, Any]) -> Dict[str, Any]:
         },
         "solver_time_limit_seconds": int(rules.get("solverTimeLimitSeconds", 10)),
         "precheck_infeasible_reasons": infeasible_reasons,
+        "shift_min_skill_coverage": shift_min_skill_coverage,
+        "employees": employees,
     }
     return {"solver_params": solver_params}
 
