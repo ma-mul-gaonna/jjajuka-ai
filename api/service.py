@@ -1,9 +1,9 @@
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Optional, List
 
 from app.graph import graph_app
 
 
-def run_schedule(input_json: Dict[str, Any], user_request: Optional[str] = None) -> Dict[str, Any]:
+def run_schedule(input_json: Dict[str, Any], user_request: Optional[str | List[str]] = None) -> Dict[str, Any]:
     state = {
         "input_json": input_json,
         "user_request": user_request,

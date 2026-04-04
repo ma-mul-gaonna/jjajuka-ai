@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from datetime import date, datetime, time, timedelta
-from typing import Any, Dict, List, Tuple
+from typing import Any, Dict, List, Tuple, Optional
 
 from features.scheduling.catalog import build_constraint_catalog
 from features.scheduling.explain import generate_explanation
@@ -60,7 +60,7 @@ def _append_reason(reasons: List[Dict[str, Any]], reason: Dict[str, Any], seen: 
 
 def llm_parse_node(state: Dict[str, Any]) -> Dict[str, Any]:
     base_input = state["input_json"]
-    user_request = state.get("user_request")
+    user_request = _normalize_user_request(state.get("user_request"))
 
     constraint_catalog = build_constraint_catalog()
     parse_result = parse_user_request(user_request, base_input)
@@ -308,3 +308,22 @@ def explain_node(state: Dict[str, Any]) -> Dict[str, Any]:
     final_schedule = state["final_schedule"]
     final_schedule["explanation"] = explanation
     return {"final_schedule": final_schedule}
+
+def _normalize_user_request(user_request: Optional[str | List[str]]) -> str:
+    if user_request is None:
+        return ""
+
+    if isinstance(user_request, str):
+        return user_request.strip()
+
+    if isinstance(user_request, list):
+        parts = []
+        for item in user_request:
+            if item is None:
+                continue
+            text = str(item).strip()
+            if text:
+                parts.append(text)
+        return ", ".join(parts)
+
+    return str(user_request).strip()

@@ -20,7 +20,7 @@ from features.scheduling.nodes import (
 
 class AgentState(TypedDict):
     input_json: Dict[str, Any]
-    user_request: Optional[str]
+    user_request: Optional[str | List[str]]
 
     constraint_catalog: Dict[str, Any]
     llm_parse_result: Dict[str, Any]

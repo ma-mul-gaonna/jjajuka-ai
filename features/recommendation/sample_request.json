@@ -1,0 +1,36 @@
+{
+  "schedule": {
+    "assignments": [
+      {
+        "assignmentId": 1,
+        "date": "2026-04-12",
+        "userId": 101,
+        "userName": "김민지",
+        "shiftName": "Night",
+        "startTime": "23:00",
+        "endTime": "07:00"
+      },
+      {
+        "assignmentId": 2,
+        "date": "2026-04-12",
+        "userId": 106,
+        "userName": "정은지",
+        "shiftName": "Day",
+        "startTime": "07:00",
+        "endTime": "15:00"
+      }
+    ]
+  },
+  "vacancy": {
+    "assignmentId": 1,
+    "date": "2026-04-12",
+    "shiftName": "Night",
+    "userId": 101
+  },
+  "rules": {
+    "minRestHours": 11,
+    "maxConsecutiveDays": 5
+  },
+  "employees": [],
+  "shifts": []
+}
