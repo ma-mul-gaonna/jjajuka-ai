@@ -68,7 +68,7 @@ class ReplacementCandidateResponse(BaseModel):
     userId: int
     userName: str
     score: int
-    reasons: List[str] = Field(default_factory=list)
+    reasons: str
 
 
 class ReplacementAbsenceResponse(BaseModel):
@@ -83,4 +83,5 @@ class ReplacementRecommendationResponse(BaseModel):
     message: str
     absence: ReplacementAbsenceResponse
     recommendations: List[ReplacementCandidateResponse] = Field(default_factory=list)
-    warnings: List[str] = Field(default_factory=list)
+    warnings: List[Dict[str, Any] | str] = Field(default_factory=list)
+    parserMode: str = "unknown"
