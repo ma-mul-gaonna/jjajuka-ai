@@ -128,7 +128,6 @@ def extract_params_node(state: Dict[str, Any]) -> Dict[str, Any]:
         employee_max_consecutive_days.append(
             int(employee.get("maxConsecutiveDays", rules.get("maxConsecutiveDays", len(dates))))
         )
-        employee_available_shifts.append(available_shift_indices)
         employee_forbidden_shifts.append(forbidden_shift_indices)
 
     shift_required_roles: List[set[str]] = []

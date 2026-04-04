@@ -167,7 +167,7 @@ def apply_llm_overrides(
                 {
                     "type": inst_type,
                     "value": value,
-                    "message": f"야간 형평성 가중치 {value}로 상향",
+                    "message": f"야간 근무 공평성 요청 반영",
                 }
             )
             continue
@@ -179,7 +179,7 @@ def apply_llm_overrides(
                 {
                     "type": inst_type,
                     "value": value,
-                    "message": f"주말 형평성 가중치 {value}로 상향",
+                    "message": f"주말 근무 공평성 요청 반영",
                 }
             )
             continue
