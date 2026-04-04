@@ -14,11 +14,7 @@ def create_schedule(payload: ScheduleRequest):
             input_json=payload.input_json,
             user_request=payload.user_request,
         )
-        return {
-            "status": result.get("status", "SUCCESS"),
-            "message": result.get("message", ""),
-            "result": result,
-        }
+        return result
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
     except Exception as e:
