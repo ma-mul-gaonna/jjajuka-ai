@@ -463,4 +463,4 @@ def _select_reason_codes(
             seen.add(code)
             deduped.append(code)
 
-    return deduped[:3]
+    return deduped[1:4]
